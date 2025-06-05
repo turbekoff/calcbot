@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/turbekoff/calcbot/pkg/env"
@@ -29,4 +34,30 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config, error: %v\n", err)
 	}
+
+	bot, err := LoadBot(config, log.Default())
+	if err != nil {
+		log.Fatalf("failed to connect telegram, error: %v\n", err)
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		log.Println("starting telegram bot")
+		if err := bot.Run(); !errors.Is(err, ErrClosed) {
+			log.Printf("failed to start telegram bot, error: %s\n", err)
+		}
+		quit <- os.Interrupt
+	}()
+
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+	defer cancel()
+
+	log.Println("stopping telegram bot")
+	if err := bot.Shutdown(ctx); err != nil {
+		log.Printf("failed to graceful shutdown telegram bot, error: %s\n", err)
+	}
+	log.Println("telegram bot stopped")
 }

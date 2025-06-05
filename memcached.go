@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,19 +17,17 @@ type cached struct {
 }
 
 type Memcached struct {
-	mu             sync.RWMutex
-	stopOnce       sync.Once
-	stopCh         chan struct{}
-	doneCh         chan struct{}
-	items          map[string]cached
-	ttlTimeout     time.Duration
-	isShuttingDown bool
+	mu          sync.RWMutex
+	cleanerOnce sync.Once
+	cleanerCh   chan struct{}
+	items       map[string]cached
+	ttlTimeout  time.Duration
+	inShutdown  atomic.Bool
 }
 
 func NewMemcached(ttlTimeout, cleanupTimeout time.Duration) *Memcached {
 	mc := &Memcached{
-		doneCh:     make(chan struct{}),
-		stopCh:     make(chan struct{}),
+		cleanerCh:  make(chan struct{}),
 		items:      make(map[string]cached),
 		ttlTimeout: ttlTimeout,
 	}
@@ -35,27 +35,13 @@ func NewMemcached(ttlTimeout, cleanupTimeout time.Duration) *Memcached {
 	go func() {
 		ticker := time.NewTicker(cleanupTimeout)
 		defer ticker.Stop()
-		defer close(mc.doneCh)
 
 		for {
 			select {
-			case <-mc.stopCh:
+			case <-mc.cleanerCh:
 				return
 			case <-ticker.C:
-				now := time.Now().UnixNano()
-				mc.mu.Lock()
-				for k, v := range mc.items {
-					if now > v.expireAt {
-						delete(mc.items, k)
-					}
-				}
-
-				isDone := mc.isShuttingDown && len(mc.items) == 0
-				mc.mu.Unlock()
-
-				if isDone {
-					return
-				}
+				mc.cleanExpiredItems()
 			}
 		}
 	}()
@@ -67,7 +53,7 @@ func (mc *Memcached) Set(key string, value interface{}) {
 	defer mc.mu.Unlock()
 
 	_, isExists := mc.items[key]
-	if mc.isShuttingDown && !isExists {
+	if mc.inShutdown.Load() && !isExists {
 		return
 	}
 
@@ -92,22 +78,81 @@ func (mc *Memcached) Get(key string) interface{} {
 	return item.value
 }
 
-func (mc *Memcached) Shutdown(ctx context.Context) error {
-	result := ErrMemcachedClosed
+const shutdownIntervalMax = 500 * time.Millisecond
 
-	mc.stopOnce.Do(func() {
-		mc.mu.Lock()
-		mc.isShuttingDown = true
-		mc.mu.Unlock()
+func (mc *Memcached) Shutdown(ctx context.Context) error {
+	mc.mu.Lock()
+	mc.inShutdown.Store(true)
+	mc.mu.Unlock()
+	mc.closeCleaner()
+
+	intervalBase := time.Millisecond
+	nextInterval := func() time.Duration {
+		interval := intervalBase + time.Duration(rand.Intn(int(intervalBase/10)))
+
+		intervalBase *= 2
+		if intervalBase > shutdownIntervalMax {
+			intervalBase = shutdownIntervalMax
+		}
+		return interval
+	}
+
+	timer := time.NewTimer(nextInterval())
+	defer timer.Stop()
+	for {
+		mc.cleanExpiredItems()
+		if mc.IsEmpty() {
+			return nil
+		}
 
 		select {
-		case <-mc.doneCh:
-			result = ErrMemcachedClosed
 		case <-ctx.Done():
-			close(mc.stopCh)
-			result = ctx.Err()
+			return ctx.Err()
+		case <-timer.C:
+			timer.Reset(nextInterval())
 		}
-	})
+	}
+}
 
-	return result
+func (mc *Memcached) Close() error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	if mc.inShutdown.Load() {
+		return ErrMemcachedClosed
+	}
+
+	mc.inShutdown.Store(true)
+	mc.closeCleaner()
+
+	for k := range mc.items {
+		delete(mc.items, k)
+	}
+	return nil
+}
+
+func (mc *Memcached) cleanExpiredItems() {
+	now := time.Now().UnixNano()
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	for k, v := range mc.items {
+		if now > v.expireAt {
+			delete(mc.items, k)
+		}
+	}
+}
+
+func (mc *Memcached) IsEmpty() bool {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return len(mc.items) == 0
+}
+
+func (mc *Memcached) closeCleaner() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.cleanerOnce.Do(func() {
+		close(mc.cleanerCh)
+	})
 }
